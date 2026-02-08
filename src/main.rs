@@ -39,7 +39,7 @@ impl EventHandler for Handler {
         }
 
         if msg.content.starts_with("!hello") {
-            let response = "Hello from Alien! 👽\nI'm a resource-efficient Rust bot deployed via `j remote deploy`";
+            let response = "IT'S CHRISTINITH! ARE YOU STUPID OR ARE YOU DEAF?!";
             if let Err(why) = msg.channel_id.say(&ctx.http, response).await {
                 error!("Error sending message: {:?}", why);
             }
