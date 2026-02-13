@@ -16,6 +16,7 @@ struct Handler {
 struct ChatRequest {
     messages: Vec<ChatMessage>,
     temperature: f32,
+    stop: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +48,12 @@ impl Handler {
                 content: user_message.to_string(),
             }],
             temperature: 0.7,
+            stop: vec![
+                "<|im_end|>".to_string(),
+                "<|im_start|>".to_string(),
+                "</s>".to_string(),
+                "[INST]".to_string(),
+            ],
         };
 
         let response = self
