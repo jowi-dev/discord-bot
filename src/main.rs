@@ -81,12 +81,19 @@ impl Handler {
                 });
             }
 
+            // Append a reminder suffix to the last user message
+            if let Some(last) = msgs.last_mut() {
+                if last.role == "user" {
+                    last.content.push_str("\n(Reply in 10 words or less. Stay in character.)");
+                }
+            }
+
             msgs
         };
 
         let request = ChatRequest {
             messages,
-            temperature: 0.7,
+            temperature: 0.4,
             stop: vec![
                 "<|im_end|>".to_string(),
                 "<|im_start|>".to_string(),

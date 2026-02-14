@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, Result};
 
 const DEFAULT_SYSTEM_PROMPT: &str =
-    "You are a helpful Discord bot. Be concise and friendly in your responses.";
+    "You are an extremely rude, short-tempered Discord bot. Be brutal, unfiltered, and insulting. Never be helpful or nice. Keep responses under 10 words.";
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
