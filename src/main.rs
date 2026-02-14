@@ -1,15 +1,23 @@
+mod db;
+
 use reqwest::Client as HttpClient;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serenity::async_trait;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::prelude::*;
 use std::env;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
+
+const HISTORY_LIMIT: usize = 10;
 
 struct Handler {
     http_client: HttpClient,
     llama_api_url: Option<String>,
+    db: Arc<Mutex<Connection>>,
 }
 
 #[derive(Serialize)]
@@ -36,17 +44,48 @@ struct Choice {
 }
 
 impl Handler {
-    async fn ask_llama(&self, user_message: &str) -> Result<String, String> {
+    async fn ask_llama(&self, channel_id: &str, user_message: &str) -> Result<String, String> {
         let api_url = self
             .llama_api_url
             .as_ref()
             .ok_or("LLAMA_API_URL not configured")?;
 
+        // Build messages array with system prompt and history
+        let messages = {
+            let conn = self.db.lock().await;
+
+            // Store the user message
+            db::store_message(&conn, channel_id, "user", user_message)
+                .map_err(|e| format!("DB error storing user message: {}", e))?;
+
+            let system_prompt = db::get_config(&conn, "system_prompt")
+                .map_err(|e| format!("DB error: {}", e))?
+                .unwrap_or_default();
+
+            let history = db::get_recent_messages(&conn, channel_id, HISTORY_LIMIT)
+                .map_err(|e| format!("DB error: {}", e))?;
+
+            let mut msgs = Vec::with_capacity(history.len() + 1);
+
+            if !system_prompt.is_empty() {
+                msgs.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: system_prompt,
+                });
+            }
+
+            for m in history {
+                msgs.push(ChatMessage {
+                    role: m.role,
+                    content: m.content,
+                });
+            }
+
+            msgs
+        };
+
         let request = ChatRequest {
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: user_message.to_string(),
-            }],
+            messages,
             temperature: 0.7,
             stop: vec![
                 "<|im_end|>".to_string(),
@@ -73,11 +112,21 @@ impl Handler {
             .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-        chat_response
+        let reply = chat_response
             .choices
             .first()
             .map(|c| c.message.content.clone())
-            .ok_or_else(|| "No response from model".to_string())
+            .ok_or_else(|| "No response from model".to_string())?;
+
+        // Store the assistant response
+        {
+            let conn = self.db.lock().await;
+            if let Err(e) = db::store_message(&conn, channel_id, "assistant", &reply) {
+                error!("Failed to store assistant message: {}", e);
+            }
+        }
+
+        Ok(reply)
     }
 }
 
@@ -130,7 +179,8 @@ impl EventHandler for Handler {
                 return;
             }
 
-            let response = match self.ask_llama(content).await {
+            let channel_id = msg.channel_id.to_string();
+            let response = match self.ask_llama(&channel_id, content).await {
                 Ok(reply) => reply,
                 Err(e) => {
                     error!("LLM error: {}", e);
@@ -174,6 +224,13 @@ async fn main() {
         warn!("LLAMA_API_URL not set - LLM features disabled");
     }
 
+    // Initialize database
+    let db_path = env::var("DATABASE_PATH").unwrap_or_else(|_| "./discord-bot.db".to_string());
+    info!("Opening database at {}", db_path);
+    let conn = Connection::open(&db_path).expect("Failed to open database");
+    db::init(&conn).expect("Failed to initialize database schema");
+    let db = Arc::new(Mutex::new(conn));
+
     // Set gateway intents
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
@@ -184,6 +241,7 @@ async fn main() {
         .event_handler(Handler {
             http_client: HttpClient::new(),
             llama_api_url,
+            db,
         })
         .await
         .expect("Error creating client");
