@@ -194,6 +194,28 @@ impl EventHandler for Handler {
             return;
         }
 
+        if msg.content.starts_with("!clear") {
+            let conn = self.db.lock().await;
+            let channel_id = msg.channel_id.to_string();
+            let mode = db::get_context_mode(&conn, &channel_id).unwrap_or_else(|_| "channel".to_string());
+            let context_key = match mode.as_str() {
+                "user" => format!("{}:{}", channel_id, msg.author.id),
+                _ => channel_id,
+            };
+            match db::clear_messages(&conn, &context_key) {
+                Ok(n) => {
+                    let response = format!("Cleared {} messages.", n);
+                    if let Err(why) = msg.channel_id.say(&ctx.http, &response).await {
+                        error!("Error sending message: {:?}", why);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to clear messages: {}", e);
+                }
+            }
+            return;
+        }
+
         if msg.content.starts_with("!contextchannel") {
             let conn = self.db.lock().await;
             let channel_id = msg.channel_id.to_string();

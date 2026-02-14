@@ -59,6 +59,13 @@ pub fn set_context_mode(conn: &Connection, channel_id: &str, mode: &str) -> Resu
     set_config(conn, &key, mode)
 }
 
+pub fn clear_messages(conn: &Connection, channel_id: &str) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM messages WHERE channel_id = ?1",
+        params![channel_id],
+    )
+}
+
 pub fn store_message(conn: &Connection, channel_id: &str, role: &str, content: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO messages (channel_id, role, content) VALUES (?1, ?2, ?3)",
