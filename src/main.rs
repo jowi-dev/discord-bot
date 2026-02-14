@@ -44,7 +44,7 @@ struct Choice {
 }
 
 impl Handler {
-    async fn ask_llama(&self, channel_id: &str, user_message: &str) -> Result<String, String> {
+    async fn ask_llama(&self, context_key: &str, user_message: &str) -> Result<String, String> {
         let api_url = self
             .llama_api_url
             .as_ref()
@@ -55,14 +55,14 @@ impl Handler {
             let conn = self.db.lock().await;
 
             // Store the user message
-            db::store_message(&conn, channel_id, "user", user_message)
+            db::store_message(&conn, context_key, "user", user_message)
                 .map_err(|e| format!("DB error storing user message: {}", e))?;
 
             let system_prompt = db::get_config(&conn, "system_prompt")
                 .map_err(|e| format!("DB error: {}", e))?
                 .unwrap_or_default();
 
-            let history = db::get_recent_messages(&conn, channel_id, HISTORY_LIMIT)
+            let history = db::get_recent_messages(&conn, context_key, HISTORY_LIMIT)
                 .map_err(|e| format!("DB error: {}", e))?;
 
             let mut msgs = Vec::with_capacity(history.len() + 1);
@@ -121,7 +121,7 @@ impl Handler {
         // Store the assistant response
         {
             let conn = self.db.lock().await;
-            if let Err(e) = db::store_message(&conn, channel_id, "assistant", &reply) {
+            if let Err(e) = db::store_message(&conn, context_key, "assistant", &reply) {
                 error!("Failed to store assistant message: {}", e);
             }
         }
@@ -154,6 +154,71 @@ impl EventHandler for Handler {
             return;
         }
 
+        if msg.content.starts_with("!systemprompt") {
+            let new_prompt = msg.content.trim_start_matches("!systemprompt").trim();
+            if new_prompt.is_empty() {
+                // Show current prompt
+                let conn = self.db.lock().await;
+                let current = db::get_config(&conn, "system_prompt")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let response = format!("**Current system prompt:**\n{}", current);
+                if let Err(why) = msg.channel_id.say(&ctx.http, &response).await {
+                    error!("Error sending message: {:?}", why);
+                }
+            } else {
+                let conn = self.db.lock().await;
+                match db::set_config(&conn, "system_prompt", new_prompt) {
+                    Ok(_) => {
+                        info!("{} updated system prompt to: {}", msg.author.name, new_prompt);
+                        if let Err(why) = msg.channel_id.say(&ctx.http, "System prompt updated!").await {
+                            error!("Error sending message: {:?}", why);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to update system prompt: {}", e);
+                        if let Err(why) = msg.channel_id.say(&ctx.http, "Failed to update system prompt.").await {
+                            error!("Error sending message: {:?}", why);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        if msg.content.starts_with("!contextchannel") {
+            let conn = self.db.lock().await;
+            let channel_id = msg.channel_id.to_string();
+            match db::set_context_mode(&conn, &channel_id, "channel") {
+                Ok(_) => {
+                    if let Err(why) = msg.channel_id.say(&ctx.http, "Context mode set to **channel** — everyone shares history here.").await {
+                        error!("Error sending message: {:?}", why);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to set context mode: {}", e);
+                }
+            }
+            return;
+        }
+
+        if msg.content.starts_with("!contextuser") {
+            let conn = self.db.lock().await;
+            let channel_id = msg.channel_id.to_string();
+            match db::set_context_mode(&conn, &channel_id, "user") {
+                Ok(_) => {
+                    if let Err(why) = msg.channel_id.say(&ctx.http, "Context mode set to **user** — everyone gets their own history here.").await {
+                        error!("Error sending message: {:?}", why);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to set context mode: {}", e);
+                }
+            }
+            return;
+        }
+
         // When mentioned, send the message to llama.cpp
         if msg.mentions_me(&ctx.http).await.unwrap_or(false) {
             info!("Received message from {}: {}", msg.author.name, msg.content);
@@ -180,7 +245,15 @@ impl EventHandler for Handler {
             }
 
             let channel_id = msg.channel_id.to_string();
-            let response = match self.ask_llama(&channel_id, content).await {
+            let context_key = {
+                let conn = self.db.lock().await;
+                let mode = db::get_context_mode(&conn, &channel_id).unwrap_or_else(|_| "channel".to_string());
+                match mode.as_str() {
+                    "user" => format!("{}:{}", channel_id, msg.author.id),
+                    _ => channel_id.clone(),
+                }
+            };
+            let response = match self.ask_llama(&context_key, content).await {
                 Ok(reply) => reply,
                 Err(e) => {
                     error!("LLM error: {}", e);

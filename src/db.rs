@@ -49,6 +49,16 @@ pub fn set_config(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn get_context_mode(conn: &Connection, channel_id: &str) -> Result<String> {
+    let key = format!("context_mode:{}", channel_id);
+    Ok(get_config(conn, &key)?.unwrap_or_else(|| "channel".to_string()))
+}
+
+pub fn set_context_mode(conn: &Connection, channel_id: &str, mode: &str) -> Result<()> {
+    let key = format!("context_mode:{}", channel_id);
+    set_config(conn, &key, mode)
+}
+
 pub fn store_message(conn: &Connection, channel_id: &str, role: &str, content: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO messages (channel_id, role, content) VALUES (?1, ?2, ?3)",
