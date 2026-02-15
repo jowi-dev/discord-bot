@@ -256,6 +256,62 @@ impl Handler {
 
         Ok(reply)
     }
+
+    async fn query_llm_oneshot(
+        &self,
+        system_prompt: String,
+        user_message: String,
+    ) -> Result<String, String> {
+        let api_url = self
+            .llama_api_url
+            .as_ref()
+            .ok_or("LLAMA_API_URL not configured")?;
+
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: system_prompt,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: user_message,
+            },
+        ];
+
+        let request = ChatRequest {
+            messages,
+            temperature: 0.4,
+            stop: vec![
+                "<|im_end|>".to_string(),
+                "<|im_start|>".to_string(),
+                "</s>".to_string(),
+                "[INST]".to_string(),
+            ],
+        };
+
+        let response = self
+            .http_client
+            .post(format!("{}/v1/chat/completions", api_url))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to reach llama.cpp: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("llama.cpp returned status {}", response.status()));
+        }
+
+        let chat_response: ChatResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        chat_response
+            .choices
+            .first()
+            .map(|c| c.message.content.clone())
+            .ok_or_else(|| "No response from model".to_string())
+    }
 }
 
 #[async_trait]
@@ -288,7 +344,8 @@ impl EventHandler for Handler {
                  `!contextuser` — Separate history per user\n\
                  `!addcharacter <name>` — Track a WoW character\n\
                  `!removecharacter <name>` — Stop tracking a character\n\
-                 `!levelcheck` — Check levels of tracked characters\n\
+                 `!levelcheck` — Check levels of tracked characters (with insults)\n\
+                 `!levelcheckraw` — Check levels without insults\n\
                  \n\
                  Mention me to chat!",
                 cap
@@ -539,6 +596,8 @@ impl EventHandler for Handler {
         }
 
         if msg.content.starts_with("!levelcheck") {
+            let use_insults = !msg.content.starts_with("!levelcheckraw");
+
             if self.battlenet_auth.is_none() {
                 if let Err(why) = msg.channel_id.say(&ctx.http, "Battle.net API not configured.").await {
                     error!("Error sending message: {:?}", why);
@@ -581,9 +640,47 @@ impl EventHandler for Handler {
 
             entries.sort_by(|a, b| b.1.cmp(&a.1));
 
+            // Fetch insults in parallel if LLM is configured and this isn't !levelcheckraw
+            let insults: Vec<Option<String>> = if use_insults && self.llama_api_url.is_some() {
+                let system_prompt = {
+                    let conn = self.db.lock().await;
+                    db::get_config(&conn, "system_prompt")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                };
+
+                let insult_futures: Vec<_> = entries
+                    .iter()
+                    .map(|(name, level, desc)| {
+                        let sys = system_prompt.clone();
+                        let prompt = format!(
+                            "Give a 1-5 word insult for a level {} {} named {}. Reply with ONLY the insult, nothing else.",
+                            level, desc, name
+                        );
+                        self.query_llm_oneshot(sys, prompt)
+                    })
+                    .collect();
+
+                join_all(insult_futures)
+                    .await
+                    .into_iter()
+                    .map(|r| r.ok())
+                    .collect()
+            } else {
+                entries.iter().map(|_| None).collect()
+            };
+
             let mut response = String::from("**Level Check — Nightslayer**\n");
-            for (name, level, desc) in &entries {
-                response.push_str(&format!("  {} — Level {} {}\n", name, level, desc));
+            for ((name, level, desc), insult) in entries.iter().zip(insults.iter()) {
+                match insult {
+                    Some(text) => response.push_str(&format!(
+                        "  {} — Level {} {} — *{}*\n", name, level, desc, text.trim()
+                    )),
+                    None => response.push_str(&format!(
+                        "  {} — Level {} {}\n", name, level, desc
+                    )),
+                }
             }
             for err in &errors {
                 response.push_str(&format!("  ⚠ {}\n", err));
