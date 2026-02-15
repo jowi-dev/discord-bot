@@ -132,7 +132,7 @@ impl Handler {
     async fn fetch_wow_character(&self, name: &str) -> Result<WowCharacter, String> {
         let token = self.get_battlenet_token().await?;
         let url = format!(
-            "https://us.api.blizzard.com/profile/wow/character/nightslayer/{}?namespace=profile-classic1x-us&locale=en_US",
+            "https://us.api.blizzard.com/profile/wow/character/nightslayer/{}?namespace=profile-classicann-us&locale=en_US",
             name.to_lowercase()
         );
 
