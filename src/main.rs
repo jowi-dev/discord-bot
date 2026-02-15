@@ -197,7 +197,15 @@ impl Handler {
             // Append a reminder suffix to the last user message
             if let Some(last) = msgs.last_mut() {
                 if last.role == "user" {
-                    last.content.push_str("\n(Reply in 10 words or less. Stay in character.)");
+                    let cap = db::get_config(&conn, "response_cap")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(10);
+                    last.content.push_str(&format!(
+                        "\n(Reply in {} words or less. Stay in character.)",
+                        cap
+                    ));
                 }
             }
 
@@ -259,6 +267,38 @@ impl EventHandler for Handler {
         }
 
         // Respond to direct commands
+        if msg.content.starts_with("!help") {
+            let cap = {
+                let conn = self.db.lock().await;
+                db::get_config(&conn, "response_cap")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(10)
+            };
+            let response = format!(
+                "**Commands:**\n\
+                 `!help` — Show this message\n\
+                 `!ping` — Pong!\n\
+                 `!hello` — Greet the bot\n\
+                 `!systemprompt [text]` — View or set the system prompt\n\
+                 `!cap <1-500>` — Set response word cap (currently **{}**)\n\
+                 `!clear` — Clear conversation history\n\
+                 `!contextchannel` — Shared history per channel\n\
+                 `!contextuser` — Separate history per user\n\
+                 `!addcharacter <name>` — Track a WoW character\n\
+                 `!removecharacter <name>` — Stop tracking a character\n\
+                 `!levelcheck` — Check levels of tracked characters\n\
+                 \n\
+                 Mention me to chat!",
+                cap
+            );
+            if let Err(why) = msg.channel_id.say(&ctx.http, &response).await {
+                error!("Error sending message: {:?}", why);
+            }
+            return;
+        }
+
         if msg.content.starts_with("!ping") {
             if let Err(why) = msg.channel_id.say(&ctx.http, "Pong! 🏓").await {
                 error!("Error sending message: {:?}", why);
@@ -299,6 +339,51 @@ impl EventHandler for Handler {
                     Err(e) => {
                         error!("Failed to update system prompt: {}", e);
                         if let Err(why) = msg.channel_id.say(&ctx.http, "Failed to update system prompt.").await {
+                            error!("Error sending message: {:?}", why);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        if msg.content.starts_with("!cap") {
+            let arg = msg.content.trim_start_matches("!cap").trim();
+            if arg.is_empty() {
+                let cap = {
+                    let conn = self.db.lock().await;
+                    db::get_config(&conn, "response_cap")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(10)
+                };
+                let response = format!("Response word cap is currently **{}**. Usage: `!cap <1-500>`", cap);
+                if let Err(why) = msg.channel_id.say(&ctx.http, &response).await {
+                    error!("Error sending message: {:?}", why);
+                }
+            } else {
+                match arg.parse::<u32>() {
+                    Ok(n) if (1..=500).contains(&n) => {
+                        let conn = self.db.lock().await;
+                        match db::set_config(&conn, "response_cap", &n.to_string()) {
+                            Ok(_) => {
+                                info!("{} set response cap to {}", msg.author.name, n);
+                                let response = format!("Response word cap set to **{}**.", n);
+                                if let Err(why) = msg.channel_id.say(&ctx.http, &response).await {
+                                    error!("Error sending message: {:?}", why);
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to set response cap: {}", e);
+                                if let Err(why) = msg.channel_id.say(&ctx.http, "Failed to save cap.").await {
+                                    error!("Error sending message: {:?}", why);
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Err(why) = msg.channel_id.say(&ctx.http, "Cap must be a number between 1 and 500.").await {
                             error!("Error sending message: {:?}", why);
                         }
                     }
