@@ -19,7 +19,13 @@ pub fn init(conn: &Connection) -> Result<()> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_messages_channel_ts
-            ON messages (channel_id, timestamp);",
+            ON messages (channel_id, timestamp);
+
+        CREATE TABLE IF NOT EXISTS tracked_characters (
+            name TEXT PRIMARY KEY COLLATE NOCASE,
+            added_by TEXT NOT NULL,
+            added_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );",
     )?;
 
     // Seed default system prompt if not present
@@ -102,6 +108,30 @@ pub fn get_recent_messages(
     // Reverse so oldest is first (we fetched newest-first for LIMIT)
     messages.reverse();
     Ok(messages)
+}
+
+pub fn add_tracked_character(conn: &Connection, name: &str, added_by: &str) -> Result<bool> {
+    let rows = conn.execute(
+        "INSERT OR IGNORE INTO tracked_characters (name, added_by) VALUES (?1, ?2)",
+        params![name, added_by],
+    )?;
+    Ok(rows > 0)
+}
+
+pub fn remove_tracked_character(conn: &Connection, name: &str) -> Result<bool> {
+    let rows = conn.execute(
+        "DELETE FROM tracked_characters WHERE name = ?1",
+        params![name],
+    )?;
+    Ok(rows > 0)
+}
+
+pub fn get_tracked_characters(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM tracked_characters ORDER BY name")?;
+    let names = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<String>>>()?;
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -187,5 +217,35 @@ mod tests {
         let msgs_b = get_recent_messages(&conn, "chan_b", 10).unwrap();
         assert_eq!(msgs_b.len(), 1);
         assert_eq!(msgs_b[0].content, "message in B");
+    }
+
+    #[test]
+    fn test_add_tracked_character() {
+        let conn = setup();
+        assert!(add_tracked_character(&conn, "Pyuul", "user123").unwrap());
+        // Duplicate insert returns false
+        assert!(!add_tracked_character(&conn, "Pyuul", "user456").unwrap());
+        // Case-insensitive duplicate
+        assert!(!add_tracked_character(&conn, "pyuul", "user789").unwrap());
+    }
+
+    #[test]
+    fn test_remove_tracked_character() {
+        let conn = setup();
+        add_tracked_character(&conn, "Pyuul", "user123").unwrap();
+        assert!(remove_tracked_character(&conn, "Pyuul").unwrap());
+        // Already removed
+        assert!(!remove_tracked_character(&conn, "Pyuul").unwrap());
+    }
+
+    #[test]
+    fn test_get_tracked_characters() {
+        let conn = setup();
+        add_tracked_character(&conn, "Zara", "user1").unwrap();
+        add_tracked_character(&conn, "Alpha", "user2").unwrap();
+        add_tracked_character(&conn, "Miko", "user3").unwrap();
+
+        let chars = get_tracked_characters(&conn).unwrap();
+        assert_eq!(chars, vec!["Alpha", "Miko", "Zara"]);
     }
 }

@@ -1,5 +1,6 @@
 mod db;
 
+use futures::future::join_all;
 use reqwest::Client as HttpClient;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -9,14 +10,60 @@ use serenity::model::gateway::Ready;
 use serenity::prelude::*;
 use std::env;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 const HISTORY_LIMIT: usize = 10;
 
+struct BattleNetAuth {
+    client_id: String,
+    client_secret: String,
+    token: Option<String>,
+    expires_at: Option<Instant>,
+}
+
+impl BattleNetAuth {
+    fn new(client_id: String, client_secret: String) -> Self {
+        Self {
+            client_id,
+            client_secret,
+            token: None,
+            expires_at: None,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        match self.expires_at {
+            Some(exp) => Instant::now() >= exp,
+            None => true,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OAuthTokenResponse {
+    access_token: String,
+    expires_in: u64,
+}
+
+#[derive(Deserialize)]
+struct WowCharacter {
+    name: String,
+    level: u32,
+    race: WowEnum,
+    character_class: WowEnum,
+}
+
+#[derive(Deserialize)]
+struct WowEnum {
+    name: String,
+}
+
 struct Handler {
     http_client: HttpClient,
     llama_api_url: Option<String>,
+    battlenet_auth: Option<Arc<Mutex<BattleNetAuth>>>,
     db: Arc<Mutex<Connection>>,
 }
 
@@ -44,6 +91,72 @@ struct Choice {
 }
 
 impl Handler {
+    async fn get_battlenet_token(&self) -> Result<String, String> {
+        let auth_lock = self
+            .battlenet_auth
+            .as_ref()
+            .ok_or("Battle.net not configured")?;
+        let mut auth = auth_lock.lock().await;
+
+        if !auth.is_expired() {
+            return Ok(auth.token.clone().unwrap());
+        }
+
+        let resp = self
+            .http_client
+            .post("https://oauth.battle.net/token")
+            .basic_auth(&auth.client_id, Some(&auth.client_secret))
+            .form(&[("grant_type", "client_credentials")])
+            .send()
+            .await
+            .map_err(|e| format!("OAuth request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("OAuth returned status {}", resp.status()));
+        }
+
+        let token_resp: OAuthTokenResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse OAuth response: {}", e))?;
+
+        // Expire 60s early to avoid edge cases
+        let expires_at = Instant::now()
+            + std::time::Duration::from_secs(token_resp.expires_in.saturating_sub(60));
+        auth.token = Some(token_resp.access_token.clone());
+        auth.expires_at = Some(expires_at);
+
+        Ok(token_resp.access_token)
+    }
+
+    async fn fetch_wow_character(&self, name: &str) -> Result<WowCharacter, String> {
+        let token = self.get_battlenet_token().await?;
+        let url = format!(
+            "https://us.api.blizzard.com/profile/wow/character/nightslayer/{}?namespace=profile-classic1x-us&locale=en_US",
+            name.to_lowercase()
+        );
+
+        let resp = self
+            .http_client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| format!("API request failed: {}", e))?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(format!("Character **{}** not found on Nightslayer.", name));
+        }
+
+        if !resp.status().is_success() {
+            return Err(format!("Blizzard API returned status {}", resp.status()));
+        }
+
+        resp.json::<WowCharacter>()
+            .await
+            .map_err(|e| format!("Failed to parse character data: {}", e))
+    }
+
     async fn ask_llama(&self, context_key: &str, user_message: &str) -> Result<String, String> {
         let api_url = self
             .llama_api_url
@@ -248,6 +361,156 @@ impl EventHandler for Handler {
             return;
         }
 
+        if msg.content.starts_with("!addcharacter") {
+            let name = msg.content.trim_start_matches("!addcharacter").trim();
+            if name.is_empty() {
+                if let Err(why) = msg.channel_id.say(&ctx.http, "Usage: `!addcharacter <name>`").await {
+                    error!("Error sending message: {:?}", why);
+                }
+                return;
+            }
+
+            if self.battlenet_auth.is_none() {
+                if let Err(why) = msg.channel_id.say(&ctx.http, "Battle.net API not configured.").await {
+                    error!("Error sending message: {:?}", why);
+                }
+                return;
+            }
+
+            let typing = msg.channel_id.start_typing(&ctx.http);
+            match self.fetch_wow_character(name).await {
+                Ok(character) => {
+                    let conn = self.db.lock().await;
+                    let added_by = msg.author.id.to_string();
+                    match db::add_tracked_character(&conn, &character.name, &added_by) {
+                        Ok(true) => {
+                            let response = format!(
+                                "Now tracking **{}** — Level {} {} {}",
+                                character.name, character.level, character.race.name, character.character_class.name
+                            );
+                            drop(typing);
+                            if let Err(why) = msg.channel_id.say(&ctx.http, &response).await {
+                                error!("Error sending message: {:?}", why);
+                            }
+                        }
+                        Ok(false) => {
+                            let response = format!(
+                                "**{}** is already tracked — Level {} {} {}",
+                                character.name, character.level, character.race.name, character.character_class.name
+                            );
+                            drop(typing);
+                            if let Err(why) = msg.channel_id.say(&ctx.http, &response).await {
+                                error!("Error sending message: {:?}", why);
+                            }
+                        }
+                        Err(e) => {
+                            error!("DB error adding character: {}", e);
+                            drop(typing);
+                            if let Err(why) = msg.channel_id.say(&ctx.http, "Failed to save character.").await {
+                                error!("Error sending message: {:?}", why);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    drop(typing);
+                    if let Err(why) = msg.channel_id.say(&ctx.http, &e).await {
+                        error!("Error sending message: {:?}", why);
+                    }
+                }
+            }
+            return;
+        }
+
+        if msg.content.starts_with("!removecharacter") {
+            let name = msg.content.trim_start_matches("!removecharacter").trim();
+            if name.is_empty() {
+                if let Err(why) = msg.channel_id.say(&ctx.http, "Usage: `!removecharacter <name>`").await {
+                    error!("Error sending message: {:?}", why);
+                }
+                return;
+            }
+
+            let conn = self.db.lock().await;
+            match db::remove_tracked_character(&conn, name) {
+                Ok(true) => {
+                    if let Err(why) = msg.channel_id.say(&ctx.http, &format!("Removed **{}** from tracking.", name)).await {
+                        error!("Error sending message: {:?}", why);
+                    }
+                }
+                Ok(false) => {
+                    if let Err(why) = msg.channel_id.say(&ctx.http, &format!("**{}** is not being tracked.", name)).await {
+                        error!("Error sending message: {:?}", why);
+                    }
+                }
+                Err(e) => {
+                    error!("DB error removing character: {}", e);
+                    if let Err(why) = msg.channel_id.say(&ctx.http, "Failed to remove character.").await {
+                        error!("Error sending message: {:?}", why);
+                    }
+                }
+            }
+            return;
+        }
+
+        if msg.content.starts_with("!levelcheck") {
+            if self.battlenet_auth.is_none() {
+                if let Err(why) = msg.channel_id.say(&ctx.http, "Battle.net API not configured.").await {
+                    error!("Error sending message: {:?}", why);
+                }
+                return;
+            }
+
+            let names = {
+                let conn = self.db.lock().await;
+                db::get_tracked_characters(&conn).unwrap_or_default()
+            };
+
+            if names.is_empty() {
+                if let Err(why) = msg.channel_id.say(&ctx.http, "No characters tracked. Use `!addcharacter <name>` to add one.").await {
+                    error!("Error sending message: {:?}", why);
+                }
+                return;
+            }
+
+            let typing = msg.channel_id.start_typing(&ctx.http);
+            let futures: Vec<_> = names
+                .iter()
+                .map(|name| self.fetch_wow_character(name))
+                .collect();
+            let results = join_all(futures).await;
+
+            let mut entries: Vec<(String, u32, String)> = Vec::new();
+            let mut errors: Vec<String> = Vec::new();
+
+            for (name, result) in names.iter().zip(results) {
+                match result {
+                    Ok(c) => entries.push((
+                        c.name,
+                        c.level,
+                        format!("{} {}", c.race.name, c.character_class.name),
+                    )),
+                    Err(e) => errors.push(format!("{}: {}", name, e)),
+                }
+            }
+
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let mut response = String::from("**Level Check — Nightslayer**\n");
+            for (name, level, desc) in &entries {
+                response.push_str(&format!("  {} — Level {} {}\n", name, level, desc));
+            }
+            for err in &errors {
+                response.push_str(&format!("  ⚠ {}\n", err));
+            }
+
+            drop(typing);
+            if let Err(why) = msg.channel_id.say(&ctx.http, &response).await {
+                error!("Error sending message: {:?}", why);
+            }
+            return;
+        }
+
         // When mentioned, send the message to llama.cpp
         if msg.mentions_me(&ctx.http).await.unwrap_or(false) {
             info!("Received message from {}: {}", msg.author.name, msg.content);
@@ -326,6 +589,21 @@ async fn main() {
         warn!("LLAMA_API_URL not set - LLM features disabled");
     }
 
+    // Get Battle.net credentials (optional)
+    let battlenet_auth = match (
+        env::var("BATTLENET_CLIENT_ID"),
+        env::var("BATTLENET_CLIENT_SECRET"),
+    ) {
+        (Ok(id), Ok(secret)) => {
+            info!("Battle.net API configured");
+            Some(Arc::new(Mutex::new(BattleNetAuth::new(id, secret))))
+        }
+        _ => {
+            warn!("BATTLENET_CLIENT_ID/SECRET not set — WoW features disabled");
+            None
+        }
+    };
+
     // Initialize database
     let db_path = env::var("DATABASE_PATH").unwrap_or_else(|_| "./discord-bot.db".to_string());
     info!("Opening database at {}", db_path);
@@ -343,6 +621,7 @@ async fn main() {
         .event_handler(Handler {
             http_client: HttpClient::new(),
             llama_api_url,
+            battlenet_auth,
             db,
         })
         .await
