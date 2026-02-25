@@ -17,6 +17,13 @@ use tracing::{error, info, warn};
 
 const COMFY_MODEL_NAME: &str = "pony-diffusion-xl.safetensors";
 
+// Quality negatives for Pony Diffusion XL. No content restrictions — this is intentional.
+const COMFY_NEGATIVE_PROMPT: &str =
+    "score_4, score_5, score_6, worst quality, bad quality, low quality, lowres, \
+     blurry, jpeg artifacts, compression artifacts, \
+     bad anatomy, bad hands, extra fingers, missing fingers, deformed, mutation, extra limbs, \
+     watermark, signature, text, logo, ugly";
+
 const HISTORY_LIMIT: usize = 10;
 
 struct BattleNetAuth {
@@ -322,7 +329,41 @@ impl Handler {
             .ok_or_else(|| "No response from model".to_string())
     }
 
-    async fn generate_image(&self, prompt: &str) -> Result<Vec<u8>, String> {
+    // Rewrites a natural-language image request into booru-style tags for Pony Diffusion XL.
+    // Falls back to the original prompt if the LLM is unavailable.
+    async fn expand_image_prompt(&self, user_prompt: &str) -> String {
+        let server_context = {
+            let conn = self.db.lock().await;
+            db::get_config(&conn, "system_prompt")
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        };
+
+        let system = format!(
+            "You are a prompt engineer for Pony Diffusion XL, a Stable Diffusion model trained \
+             on booru-style image tags. Convert the image request into a comma-separated list of \
+             tags. Include: subject details, species/race, clothing/armor, art style, lighting, \
+             setting, and mood. Do NOT include score tags (added separately). \
+             Reply with ONLY the tags, nothing else.\n\
+             \n\
+             Server context — use this to interpret references correctly: {}",
+            server_context
+        );
+
+        match self.query_llm_oneshot(system, user_prompt.to_string()).await {
+            Ok(tags) => {
+                info!("Expanded image prompt: {} -> {}", user_prompt, tags.trim());
+                tags.trim().to_string()
+            }
+            Err(e) => {
+                warn!("LLM prompt expansion failed, using raw prompt: {}", e);
+                user_prompt.to_string()
+            }
+        }
+    }
+
+    async fn generate_image(&self, prompt: &str, width: u32, height: u32) -> Result<Vec<u8>, String> {
         let api_url = self
             .comfy_api_url
             .as_ref()
@@ -344,7 +385,7 @@ impl Handler {
             },
             "5": {
                 "class_type": "EmptyLatentImage",
-                "inputs": { "width": 1024, "height": 1024, "batch_size": 1 }
+                "inputs": { "width": width, "height": height, "batch_size": 1 }
             },
             "6": {
                 "class_type": "CLIPTextEncode",
@@ -353,7 +394,7 @@ impl Handler {
             "7": {
                 "class_type": "CLIPTextEncode",
                 "inputs": {
-                    "text": "score_4, score_5, worst quality, bad quality, blurry, lowres",
+                    "text": COMFY_NEGATIVE_PROMPT,
                     "clip": ["4", 1]
                 }
             },
@@ -475,6 +516,8 @@ impl EventHandler for Handler {
                  `!ping` — Pong!\n\
                  `!hello` — Greet the bot\n\
                  `!imagine <prompt>` — Generate an image\n\
+                 `!imagine portrait: <prompt>` — Generate a portrait (832×1216)\n\
+                 `!imagine landscape: <prompt>` — Generate a landscape (1216×832)\n\
                  `!systemprompt [text]` — View or set the system prompt\n\
                  `!cap <1-500>` — Set response word cap (currently **{}**)\n\
                  `!clear` — Clear conversation history\n\
@@ -832,18 +875,33 @@ impl EventHandler for Handler {
         }
 
         if msg.content.starts_with("!imagine") {
-            let prompt = msg.content.trim_start_matches("!imagine").trim();
+            let raw = msg.content.trim_start_matches("!imagine").trim();
 
-            if prompt.is_empty() {
-                if let Err(why) = msg.channel_id.say(&ctx.http, "Usage: `!imagine <prompt>`").await {
+            if raw.is_empty() {
+                if let Err(why) = msg.channel_id.say(
+                    &ctx.http,
+                    "Usage: `!imagine [portrait:|landscape:] <prompt>`",
+                ).await {
                     error!("Error sending message: {:?}", why);
                 }
                 return;
             }
 
+            // Parse optional aspect ratio prefix
+            let (prompt, width, height) = if let Some(p) = raw.strip_prefix("portrait:") {
+                (p.trim(), 832u32, 1216u32)
+            } else if let Some(p) = raw.strip_prefix("landscape:") {
+                (p.trim(), 1216u32, 832u32)
+            } else {
+                (raw, 1024u32, 1024u32)
+            };
+
             let typing = msg.channel_id.start_typing(&ctx.http);
 
-            match self.generate_image(prompt).await {
+            // Expand to booru-style tags using LLM, falling back to raw prompt on failure
+            let expanded = self.expand_image_prompt(prompt).await;
+
+            match self.generate_image(&expanded, width, height).await {
                 Ok(image_bytes) => {
                     drop(typing);
                     let attachment = CreateAttachment::bytes(image_bytes, "generated.png");
