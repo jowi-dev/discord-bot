@@ -5,6 +5,7 @@ use reqwest::Client as HttpClient;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serenity::async_trait;
+use serenity::builder::{CreateAttachment, CreateMessage};
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::prelude::*;
@@ -13,6 +14,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
+
+const COMFY_MODEL_NAME: &str = "pony-diffusion-xl.safetensors";
 
 const HISTORY_LIMIT: usize = 10;
 
@@ -63,8 +66,14 @@ struct WowEnum {
 struct Handler {
     http_client: HttpClient,
     llama_api_url: Option<String>,
+    comfy_api_url: Option<String>,
     battlenet_auth: Option<Arc<Mutex<BattleNetAuth>>>,
     db: Arc<Mutex<Connection>>,
+}
+
+#[derive(Deserialize)]
+struct ComfyPromptResponse {
+    prompt_id: String,
 }
 
 #[derive(Serialize)]
@@ -312,6 +321,134 @@ impl Handler {
             .map(|c| c.message.content.clone())
             .ok_or_else(|| "No response from model".to_string())
     }
+
+    async fn generate_image(&self, prompt: &str) -> Result<Vec<u8>, String> {
+        let api_url = self
+            .comfy_api_url
+            .as_ref()
+            .ok_or("COMFY_API_URL not configured")?;
+
+        // Use nanoseconds of current time as a seed for variety
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+
+        // Pony Diffusion XL uses score tags in positive prompt for quality control
+        let positive_prompt = format!("score_9, score_8_up, score_7_up, {}", prompt);
+
+        let workflow = serde_json::json!({
+            "4": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": { "ckpt_name": COMFY_MODEL_NAME }
+            },
+            "5": {
+                "class_type": "EmptyLatentImage",
+                "inputs": { "width": 1024, "height": 1024, "batch_size": 1 }
+            },
+            "6": {
+                "class_type": "CLIPTextEncode",
+                "inputs": { "text": positive_prompt, "clip": ["4", 1] }
+            },
+            "7": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {
+                    "text": "score_4, score_5, worst quality, bad quality, blurry, lowres",
+                    "clip": ["4", 1]
+                }
+            },
+            "3": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": seed,
+                    "steps": 25,
+                    "cfg": 6.0,
+                    "sampler_name": "euler_ancestral",
+                    "scheduler": "normal",
+                    "denoise": 1.0,
+                    "model": ["4", 0],
+                    "positive": ["6", 0],
+                    "negative": ["7", 0],
+                    "latent_image": ["5", 0]
+                }
+            },
+            "8": {
+                "class_type": "VAEDecode",
+                "inputs": { "samples": ["3", 0], "vae": ["4", 2] }
+            },
+            "9": {
+                "class_type": "SaveImage",
+                "inputs": { "filename_prefix": "discord", "images": ["8", 0] }
+            }
+        });
+
+        let resp = self
+            .http_client
+            .post(format!("{}/prompt", api_url))
+            .json(&serde_json::json!({ "prompt": workflow }))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to reach ComfyUI: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("ComfyUI /prompt returned {}", resp.status()));
+        }
+
+        let prompt_resp: ComfyPromptResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse ComfyUI response: {}", e))?;
+
+        let prompt_id = prompt_resp.prompt_id;
+
+        // Poll /history until generation completes (timeout 120s)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let filename = loop {
+            if std::time::Instant::now() > deadline {
+                return Err("Image generation timed out".to_string());
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            let history: serde_json::Value = self
+                .http_client
+                .get(format!("{}/history/{}", api_url, prompt_id))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to poll ComfyUI history: {}", e))?
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse history: {}", e))?;
+
+            if let Some(filename) = history
+                .get(&prompt_id)
+                .and_then(|e| e.pointer("/outputs/9/images/0/filename"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+            {
+                break filename;
+            }
+        };
+
+        let image_resp = self
+            .http_client
+            .get(format!("{}/view", api_url))
+            .query(&[("filename", filename.as_str()), ("subfolder", ""), ("type", "output")])
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch generated image: {}", e))?;
+
+        if !image_resp.status().is_success() {
+            return Err(format!("ComfyUI /view returned {}", image_resp.status()));
+        }
+
+        let bytes = image_resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed to read image bytes: {}", e))?;
+
+        Ok(bytes.to_vec())
+    }
 }
 
 #[async_trait]
@@ -337,6 +474,7 @@ impl EventHandler for Handler {
                  `!help` — Show this message\n\
                  `!ping` — Pong!\n\
                  `!hello` — Greet the bot\n\
+                 `!imagine <prompt>` — Generate an image\n\
                  `!systemprompt [text]` — View or set the system prompt\n\
                  `!cap <1-500>` — Set response word cap (currently **{}**)\n\
                  `!clear` — Clear conversation history\n\
@@ -693,6 +831,44 @@ impl EventHandler for Handler {
             return;
         }
 
+        if msg.content.starts_with("!imagine") {
+            let prompt = msg.content.trim_start_matches("!imagine").trim();
+
+            if prompt.is_empty() {
+                if let Err(why) = msg.channel_id.say(&ctx.http, "Usage: `!imagine <prompt>`").await {
+                    error!("Error sending message: {:?}", why);
+                }
+                return;
+            }
+
+            let typing = msg.channel_id.start_typing(&ctx.http);
+
+            match self.generate_image(prompt).await {
+                Ok(image_bytes) => {
+                    drop(typing);
+                    let attachment = CreateAttachment::bytes(image_bytes, "generated.png");
+                    if let Err(why) = msg
+                        .channel_id
+                        .send_message(&ctx.http, CreateMessage::new().add_file(attachment))
+                        .await
+                    {
+                        error!("Error sending image: {:?}", why);
+                        if let Err(why) = msg.channel_id.say(&ctx.http, "Sorry, failed to send the generated image.").await {
+                            error!("Error sending message: {:?}", why);
+                        }
+                    }
+                }
+                Err(e) => {
+                    drop(typing);
+                    error!("Image generation error: {}", e);
+                    if let Err(why) = msg.channel_id.say(&ctx.http, "Sorry, no available image generator at this time.").await {
+                        error!("Error sending message: {:?}", why);
+                    }
+                }
+            }
+            return;
+        }
+
         // When mentioned, send the message to llama.cpp
         if msg.mentions_me(&ctx.http).await.unwrap_or(false) {
             info!("Received message from {}: {}", msg.author.name, msg.content);
@@ -771,6 +947,14 @@ async fn main() {
         warn!("LLAMA_API_URL not set - LLM features disabled");
     }
 
+    // Get ComfyUI API URL (optional - bot works without it but !imagine will fail gracefully)
+    let comfy_api_url = env::var("COMFY_API_URL").ok();
+    if comfy_api_url.is_some() {
+        info!("COMFY_API_URL configured: {}", comfy_api_url.as_ref().unwrap());
+    } else {
+        warn!("COMFY_API_URL not set - image generation disabled");
+    }
+
     // Get Battle.net credentials (optional)
     let battlenet_auth = match (
         env::var("BATTLENET_CLIENT_ID"),
@@ -803,6 +987,7 @@ async fn main() {
         .event_handler(Handler {
             http_client: HttpClient::new(),
             llama_api_url,
+            comfy_api_url,
             battlenet_auth,
             db,
         })
