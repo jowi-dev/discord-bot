@@ -15,14 +15,14 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-const COMFY_MODEL_NAME: &str = "pony-diffusion-xl.safetensors";
+// Download from CivitAI: https://civitai.com/models/25694 — rename to this filename.
+const COMFY_MODEL_NAME: &str = "epicrealism.safetensors";
 
-// Quality negatives for Pony Diffusion XL. No content restrictions — this is intentional.
+// No content restrictions — this is intentional.
 const COMFY_NEGATIVE_PROMPT: &str =
-    "score_4, score_5, score_6, worst quality, bad quality, low quality, lowres, \
-     blurry, jpeg artifacts, compression artifacts, \
+    "worst quality, bad quality, low quality, lowres, blurry, jpeg artifacts, \
      bad anatomy, bad hands, extra fingers, missing fingers, deformed, mutation, extra limbs, \
-     watermark, signature, text, logo, ugly";
+     watermark, signature, text, logo, ugly, poorly drawn face, out of frame";
 
 const HISTORY_LIMIT: usize = 10;
 
@@ -429,7 +429,7 @@ impl Handler {
             .ok_or_else(|| "No response from model".to_string())
     }
 
-    // Rewrites a natural-language image request into booru-style tags for Pony Diffusion XL.
+    // Expands a natural-language image request into a detailed prompt for epiCRealism.
     // Falls back to the original prompt if the LLM is unavailable.
     async fn expand_image_prompt(&self, user_prompt: &str) -> String {
         let server_context = {
@@ -441,11 +441,12 @@ impl Handler {
         };
 
         let system = format!(
-            "You are a prompt engineer for Pony Diffusion XL, a Stable Diffusion model trained \
-             on booru-style image tags. Convert the image request into a comma-separated list of \
-             tags. Include: subject details, species/race, clothing/armor, art style, lighting, \
-             setting, and mood. Do NOT include score tags (added separately). \
-             Reply with ONLY the tags, nothing else.\n\
+            "You are a prompt engineer for epiCRealism, a photorealistic Stable Diffusion 1.5 model. \
+             Expand the image request into a detailed, comma-separated prompt. \
+             Include: subject description, clothing or lack thereof, physical details, pose, \
+             lighting, setting, camera angle, and photo style (e.g. 'DSLR photo', 'cinematic lighting'). \
+             Be specific and descriptive. Do NOT add quality tags like 'masterpiece' or 'best quality'. \
+             Reply with ONLY the prompt, nothing else.\n\
              \n\
              Server context — use this to interpret references correctly: {}",
             server_context
@@ -475,8 +476,7 @@ impl Handler {
             .unwrap_or_default()
             .subsec_nanos() as u64;
 
-        // Pony Diffusion XL uses score tags in positive prompt for quality control
-        let positive_prompt = format!("score_9, score_8_up, score_7_up, {}", prompt);
+        let positive_prompt = prompt.to_string();
 
         let workflow = serde_json::json!({
             "4": {
@@ -503,9 +503,9 @@ impl Handler {
                 "inputs": {
                     "seed": seed,
                     "steps": 14,
-                    "cfg": 6.0,
-                    "sampler_name": "euler_ancestral",
-                    "scheduler": "normal",
+                    "cfg": 7.0,
+                    "sampler_name": "dpmpp_2m",
+                    "scheduler": "karras",
                     "denoise": 1.0,
                     "model": ["4", 0],
                     "positive": ["6", 0],
@@ -616,8 +616,8 @@ impl EventHandler for Handler {
                  `!ping` — Pong!\n\
                  `!hello` — Greet the bot\n\
                  `!imagine <prompt>` — Generate an image\n\
-                 `!imagine portrait: <prompt>` — Generate a portrait (704×1024)\n\
-                 `!imagine landscape: <prompt>` — Generate a landscape (1024×704)\n\
+                 `!imagine portrait: <prompt>` — Generate a portrait (512×768)\n\
+                 `!imagine landscape: <prompt>` — Generate a landscape (768×512)\n\
                  `!systemprompt [text]` — View or set the system prompt\n\
                  `!cap <1-500>` — Set response word cap (currently **{}**)\n\
                  `!health` — Show LLM and image gen server status\n\
@@ -1002,11 +1002,11 @@ impl EventHandler for Handler {
             // Resolutions kept at SDXL-native ratios but lower pixel count to
             // reduce thermal load on the laptop GPU.
             let (prompt, width, height) = if let Some(p) = raw.strip_prefix("portrait:") {
-                (p.trim(), 704u32, 1024u32)
+                (p.trim(), 512u32, 768u32)
             } else if let Some(p) = raw.strip_prefix("landscape:") {
-                (p.trim(), 1024u32, 704u32)
+                (p.trim(), 768u32, 512u32)
             } else {
-                (raw, 704u32, 704u32)
+                (raw, 512u32, 512u32)
             };
 
             let typing = msg.channel_id.start_typing(&ctx.http);
