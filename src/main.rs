@@ -402,7 +402,7 @@ impl Handler {
                 "class_type": "KSampler",
                 "inputs": {
                     "seed": seed,
-                    "steps": 25,
+                    "steps": 20,
                     "cfg": 6.0,
                     "sampler_name": "euler_ancestral",
                     "scheduler": "normal",
@@ -887,13 +887,15 @@ impl EventHandler for Handler {
                 return;
             }
 
-            // Parse optional aspect ratio prefix
+            // Parse optional aspect ratio prefix.
+            // Resolutions kept at SDXL-native ratios but lower pixel count to
+            // reduce thermal load on the laptop GPU.
             let (prompt, width, height) = if let Some(p) = raw.strip_prefix("portrait:") {
-                (p.trim(), 832u32, 1216u32)
+                (p.trim(), 832u32, 1152u32)
             } else if let Some(p) = raw.strip_prefix("landscape:") {
-                (p.trim(), 1216u32, 832u32)
+                (p.trim(), 1152u32, 832u32)
             } else {
-                (raw, 1024u32, 1024u32)
+                (raw, 768u32, 768u32)
             };
 
             let typing = msg.channel_id.start_typing(&ctx.http);
