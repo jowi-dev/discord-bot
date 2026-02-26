@@ -402,7 +402,7 @@ impl Handler {
                 "class_type": "KSampler",
                 "inputs": {
                     "seed": seed,
-                    "steps": 20,
+                    "steps": 14,
                     "cfg": 6.0,
                     "sampler_name": "euler_ancestral",
                     "scheduler": "normal",
@@ -516,8 +516,8 @@ impl EventHandler for Handler {
                  `!ping` — Pong!\n\
                  `!hello` — Greet the bot\n\
                  `!imagine <prompt>` — Generate an image\n\
-                 `!imagine portrait: <prompt>` — Generate a portrait (832×1216)\n\
-                 `!imagine landscape: <prompt>` — Generate a landscape (1216×832)\n\
+                 `!imagine portrait: <prompt>` — Generate a portrait (704×1024)\n\
+                 `!imagine landscape: <prompt>` — Generate a landscape (1024×704)\n\
                  `!systemprompt [text]` — View or set the system prompt\n\
                  `!cap <1-500>` — Set response word cap (currently **{}**)\n\
                  `!clear` — Clear conversation history\n\
@@ -891,11 +891,11 @@ impl EventHandler for Handler {
             // Resolutions kept at SDXL-native ratios but lower pixel count to
             // reduce thermal load on the laptop GPU.
             let (prompt, width, height) = if let Some(p) = raw.strip_prefix("portrait:") {
-                (p.trim(), 832u32, 1152u32)
+                (p.trim(), 704u32, 1024u32)
             } else if let Some(p) = raw.strip_prefix("landscape:") {
-                (p.trim(), 1152u32, 832u32)
+                (p.trim(), 1024u32, 704u32)
             } else {
-                (raw, 768u32, 768u32)
+                (raw, 704u32, 704u32)
             };
 
             let typing = msg.channel_id.start_typing(&ctx.http);
