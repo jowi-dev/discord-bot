@@ -73,9 +73,16 @@ struct WowEnum {
 struct Handler {
     http_client: HttpClient,
     llama_api_url: Option<String>,
+    llama_hosts: Vec<(String, String)>, // (name, url) pairs for health checks
     comfy_api_url: Option<String>,
+    comfy_hosts: Vec<(String, String)>, // (name, url) pairs for health checks
     battlenet_auth: Option<Arc<Mutex<BattleNetAuth>>>,
     db: Arc<Mutex<Connection>>,
+}
+
+#[derive(Deserialize)]
+struct LlamaHealthResponse {
+    status: String,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +178,99 @@ impl Handler {
         resp.json::<WowCharacter>()
             .await
             .map_err(|e| format!("Failed to parse character data: {}", e))
+    }
+
+    async fn check_llama_health(&self, url: &str) -> String {
+        let result = self
+            .http_client
+            .get(format!("{}/health", url))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+
+        match result {
+            Err(_) => "❌ unreachable".to_string(),
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<LlamaHealthResponse>().await {
+                    Ok(h) if h.status == "ok" => "✅ ok".to_string(),
+                    Ok(h) => format!("⚠ {}", h.status),
+                    Err(_) => "✅ reachable".to_string(),
+                }
+            }
+            Ok(resp) if resp.status() == 503 => {
+                match resp.json::<LlamaHealthResponse>().await {
+                    Ok(h) => format!("⏳ {}", h.status),
+                    Err(_) => "⏳ unavailable (503)".to_string(),
+                }
+            }
+            Ok(resp) => format!("❌ HTTP {}", resp.status()),
+        }
+    }
+
+    async fn check_comfy_health(&self, url: &str) -> String {
+        let result = self
+            .http_client
+            .get(format!("{}/system_stats", url))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+
+        match result {
+            Err(_) => "❌ unreachable".to_string(),
+            Ok(resp) if resp.status().is_success() => "✅ ok".to_string(),
+            Ok(resp) => format!("❌ HTTP {}", resp.status()),
+        }
+    }
+
+    async fn health_check(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+
+        // LLM (text gen)
+        lines.push("**LLM (text gen)**".to_string());
+        if self.llama_hosts.is_empty() && self.llama_api_url.is_none() {
+            lines.push("  not configured".to_string());
+        } else {
+            let host_futs: Vec<_> = self
+                .llama_hosts
+                .iter()
+                .map(|(name, url)| async move { (name.as_str(), self.check_llama_health(url).await) })
+                .collect();
+            let host_results = join_all(host_futs).await;
+            for (name, status) in host_results {
+                lines.push(format!("  {}: {}", name, status));
+            }
+            if let Some(router_url) = &self.llama_api_url {
+                let status = self.check_llama_health(router_url).await;
+                lines.push(format!("  router: {}", status));
+            }
+        }
+
+        lines.push(String::new());
+
+        // Image gen (ComfyUI)
+        lines.push("**Image gen (ComfyUI)**".to_string());
+        if self.comfy_hosts.is_empty() && self.comfy_api_url.is_none() {
+            lines.push("  not configured".to_string());
+        } else {
+            let host_futs: Vec<_> = self
+                .comfy_hosts
+                .iter()
+                .map(|(name, url)| async move { (name.as_str(), self.check_comfy_health(url).await) })
+                .collect();
+            let host_results = join_all(host_futs).await;
+            for (name, status) in host_results {
+                lines.push(format!("  {}: {}", name, status));
+            }
+            if let Some(comfy_url) = &self.comfy_api_url {
+                // Only show fallback router entry if no named hosts cover it
+                if self.comfy_hosts.is_empty() {
+                    let status = self.check_comfy_health(comfy_url).await;
+                    lines.push(format!("  comfyui: {}", status));
+                }
+            }
+        }
+
+        lines.join("\n")
     }
 
     async fn ask_llama(&self, context_key: &str, user_message: &str) -> Result<String, String> {
@@ -520,6 +620,7 @@ impl EventHandler for Handler {
                  `!imagine landscape: <prompt>` — Generate a landscape (1024×704)\n\
                  `!systemprompt [text]` — View or set the system prompt\n\
                  `!cap <1-500>` — Set response word cap (currently **{}**)\n\
+                 `!health` — Show LLM and image gen server status\n\
                  `!clear` — Clear conversation history\n\
                  `!contextchannel` — Shared history per channel\n\
                  `!contextuser` — Separate history per user\n\
@@ -547,6 +648,16 @@ impl EventHandler for Handler {
         if msg.content.starts_with("!hello") {
             let response = "IT'S CHRISTINITH! ARE YOU STUPID OR ARE YOU DEAF?!";
             if let Err(why) = msg.channel_id.say(&ctx.http, response).await {
+                error!("Error sending message: {:?}", why);
+            }
+            return;
+        }
+
+        if msg.content.starts_with("!health") {
+            let typing = msg.channel_id.start_typing(&ctx.http);
+            let response = self.health_check().await;
+            drop(typing);
+            if let Err(why) = msg.channel_id.say(&ctx.http, &response).await {
                 error!("Error sending message: {:?}", why);
             }
             return;
@@ -1007,12 +1118,42 @@ async fn main() {
         warn!("LLAMA_API_URL not set - LLM features disabled");
     }
 
+    // Parse named LLM hosts for health checks (e.g. "reflect=http://reflect.local:8080,yoga=http://yoga.local:8080")
+    let llama_hosts: Vec<(String, String)> = env::var("LLAMA_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|entry| {
+            let mut parts = entry.splitn(2, '=');
+            let name = parts.next()?.trim().to_string();
+            let url = parts.next()?.trim().to_string();
+            if name.is_empty() || url.is_empty() { None } else { Some((name, url)) }
+        })
+        .collect();
+    if !llama_hosts.is_empty() {
+        info!("LLAMA_HOSTS configured: {:?}", llama_hosts.iter().map(|(n, _)| n).collect::<Vec<_>>());
+    }
+
     // Get ComfyUI API URL (optional - bot works without it but !imagine will fail gracefully)
     let comfy_api_url = env::var("COMFY_API_URL").ok();
     if comfy_api_url.is_some() {
         info!("COMFY_API_URL configured: {}", comfy_api_url.as_ref().unwrap());
     } else {
         warn!("COMFY_API_URL not set - image generation disabled");
+    }
+
+    // Parse named ComfyUI hosts for health checks (e.g. "reflect=http://reflect.local:8188")
+    let comfy_hosts: Vec<(String, String)> = env::var("COMFY_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|entry| {
+            let mut parts = entry.splitn(2, '=');
+            let name = parts.next()?.trim().to_string();
+            let url = parts.next()?.trim().to_string();
+            if name.is_empty() || url.is_empty() { None } else { Some((name, url)) }
+        })
+        .collect();
+    if !comfy_hosts.is_empty() {
+        info!("COMFY_HOSTS configured: {:?}", comfy_hosts.iter().map(|(n, _)| n).collect::<Vec<_>>());
     }
 
     // Get Battle.net credentials (optional)
@@ -1047,7 +1188,9 @@ async fn main() {
         .event_handler(Handler {
             http_client: HttpClient::new(),
             llama_api_url,
+            llama_hosts,
             comfy_api_url,
+            comfy_hosts,
             battlenet_auth,
             db,
         })
