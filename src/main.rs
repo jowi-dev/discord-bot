@@ -618,6 +618,7 @@ impl EventHandler for Handler {
                  `!imagine <prompt>` — Generate an image\n\
                  `!imagine portrait: <prompt>` — Generate a portrait (512×768)\n\
                  `!imagine landscape: <prompt>` — Generate a landscape (768×512)\n\
+                 `!imagine debug: <prompt>` — Show expanded prompt without generating\n\
                  `!systemprompt [text]` — View or set the system prompt\n\
                  `!imageprompt [text]` — View or set the image generation context\n\
                  `!cap <1-500>` — Set response word cap (currently **{}**)\n\
@@ -1024,16 +1025,26 @@ impl EventHandler for Handler {
             if raw.is_empty() {
                 if let Err(why) = msg.channel_id.say(
                     &ctx.http,
-                    "Usage: `!imagine [portrait:|landscape:] <prompt>`",
+                    "Usage: `!imagine [portrait:|landscape:|debug:] <prompt>`",
                 ).await {
                     error!("Error sending message: {:?}", why);
                 }
                 return;
             }
 
-            // Parse optional aspect ratio prefix.
-            // Resolutions kept at SDXL-native ratios but lower pixel count to
-            // reduce thermal load on the laptop GPU.
+            // debug: mode — show expanded prompt without generating
+            if let Some(p) = raw.strip_prefix("debug:") {
+                let prompt = p.trim();
+                let typing = msg.channel_id.start_typing(&ctx.http);
+                let expanded = self.expand_image_prompt(prompt).await;
+                drop(typing);
+                let response = format!("**Expanded prompt:**\n```\n{}\n```", expanded);
+                if let Err(why) = msg.channel_id.say(&ctx.http, &response).await {
+                    error!("Error sending message: {:?}", why);
+                }
+                return;
+            }
+
             let (prompt, width, height) = if let Some(p) = raw.strip_prefix("portrait:") {
                 (p.trim(), 512u32, 768u32)
             } else if let Some(p) = raw.strip_prefix("landscape:") {
@@ -1044,7 +1055,7 @@ impl EventHandler for Handler {
 
             let typing = msg.channel_id.start_typing(&ctx.http);
 
-            // Expand to booru-style tags using LLM, falling back to raw prompt on failure
+            // Expand prompt using LLM, falling back to raw prompt on failure
             let expanded = self.expand_image_prompt(prompt).await;
 
             match self.generate_image(&expanded, width, height).await {
