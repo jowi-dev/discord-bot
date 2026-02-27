@@ -434,7 +434,7 @@ impl Handler {
     async fn expand_image_prompt(&self, user_prompt: &str) -> String {
         let server_context = {
             let conn = self.db.lock().await;
-            db::get_config(&conn, "system_prompt")
+            db::get_config(&conn, "image_prompt")
                 .ok()
                 .flatten()
                 .unwrap_or_default()
@@ -619,6 +619,7 @@ impl EventHandler for Handler {
                  `!imagine portrait: <prompt>` — Generate a portrait (512×768)\n\
                  `!imagine landscape: <prompt>` — Generate a landscape (768×512)\n\
                  `!systemprompt [text]` — View or set the system prompt\n\
+                 `!imageprompt [text]` — View or set the image generation context\n\
                  `!cap <1-500>` — Set response word cap (currently **{}**)\n\
                  `!health` — Show LLM and image gen server status\n\
                  `!clear` — Clear conversation history\n\
@@ -688,6 +689,38 @@ impl EventHandler for Handler {
                     Err(e) => {
                         error!("Failed to update system prompt: {}", e);
                         if let Err(why) = msg.channel_id.say(&ctx.http, "Failed to update system prompt.").await {
+                            error!("Error sending message: {:?}", why);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        if msg.content.starts_with("!imageprompt") {
+            let new_prompt = msg.content.trim_start_matches("!imageprompt").trim();
+            if new_prompt.is_empty() {
+                let conn = self.db.lock().await;
+                let current = db::get_config(&conn, "image_prompt")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let response = format!("**Current image prompt context:**\n{}", current);
+                if let Err(why) = msg.channel_id.say(&ctx.http, &response).await {
+                    error!("Error sending message: {:?}", why);
+                }
+            } else {
+                let conn = self.db.lock().await;
+                match db::set_config(&conn, "image_prompt", new_prompt) {
+                    Ok(_) => {
+                        info!("{} updated image prompt to: {}", msg.author.name, new_prompt);
+                        if let Err(why) = msg.channel_id.say(&ctx.http, "Image prompt context updated!").await {
+                            error!("Error sending message: {:?}", why);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to update image prompt: {}", e);
+                        if let Err(why) = msg.channel_id.say(&ctx.http, "Failed to update image prompt context.").await {
                             error!("Error sending message: {:?}", why);
                         }
                     }
