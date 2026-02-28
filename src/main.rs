@@ -442,11 +442,13 @@ impl Handler {
 
         let system = format!(
             "You are a prompt engineer for epiCRealism, a photorealistic Stable Diffusion 1.5 model. \
-             Expand the image request into a detailed, comma-separated prompt. \
-             Include: subject description, clothing or lack thereof, physical details, pose, \
-             lighting, setting, camera angle, and photo style (e.g. 'DSLR photo', 'cinematic lighting'). \
-             Be specific and descriptive. Do NOT add quality tags like 'masterpiece' or 'best quality'. \
-             Reply with ONLY the prompt, nothing else.\n\
+             Convert the image request into a list of comma-separated descriptive tags. \
+             Do NOT write sentences or prose. Do NOT use words like 'a', 'the', 'with', 'its', 'and', 'is', 'are'. \
+             Include tags for: subject, physical details, clothing, pose, lighting, setting, camera angle, photo style. \
+             Do NOT add quality tags like 'masterpiece' or 'best quality'. \
+             Reply with ONLY the comma-separated tags, nothing else.\n\
+             \n\
+             Example output: green-skinned troll, glowing yellow eyes, pizza shield, bratwurst sword, heroic pose, dark misty forest, low angle shot, cinematic lighting, DSLR photo\n\
              \n\
              Server context — use this to interpret references correctly: {}",
             server_context
