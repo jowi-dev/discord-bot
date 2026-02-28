@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 // Download from CivitAI: https://civitai.com/models/257749
-const COMFY_MODEL_NAME: &str = "pony-diffusion-xl.safetensors";
+const COMFY_MODEL_NAME: &str = "juggernautXL_ragnarokBy.safetensors";
 
 // No content restrictions — this is intentional.
 const COMFY_NEGATIVE_PROMPT: &str =
