@@ -15,8 +15,8 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-// Download from CivitAI: https://civitai.com/models/25694 — rename to this filename.
-const COMFY_MODEL_NAME: &str = "epicrealism.safetensors";
+// Download from CivitAI: https://civitai.com/models/257749
+const COMFY_MODEL_NAME: &str = "pony-diffusion-xl.safetensors";
 
 // No content restrictions — this is intentional.
 const COMFY_NEGATIVE_PROMPT: &str =
@@ -441,14 +441,15 @@ impl Handler {
         };
 
         let system = format!(
-            "You are a prompt engineer for epiCRealism, a photorealistic Stable Diffusion 1.5 model. \
-             Convert the image request into a list of comma-separated descriptive tags. \
+            "You are a prompt engineer for Pony Diffusion XL, a Stable Diffusion XL model. \
+             Convert the user's image request into a list of comma-separated descriptive tags. \
              Do NOT write sentences or prose. Do NOT use words like 'a', 'the', 'with', 'its', 'and', 'is', 'are'. \
-             Include tags for: subject, physical details, clothing, pose, lighting, setting, camera angle, photo style. \
-             Do NOT add quality tags like 'masterpiece' or 'best quality'. \
+             Include tags for: subject, physical details, clothing, pose, lighting, setting, camera angle, art style. \
              Reply with ONLY the comma-separated tags, nothing else.\n\
              \n\
-             Example output: green-skinned troll, glowing yellow eyes, pizza shield, bratwurst sword, heroic pose, dark misty forest, low angle shot, cinematic lighting, DSLR photo\n\
+             Example:\n\
+             Input: a knight fighting a dragon at sunset\n\
+             Output: armored knight, sword raised, dragon, scales, fire breath, golden sunset, rocky cliff, epic battle, low angle shot, cinematic lighting, detailed illustration\n\
              \n\
              Server context — use this to interpret references correctly: {}",
             server_context
