@@ -110,24 +110,24 @@ pub fn event_llm_system_prompt(event: &Event, global_fallback: &str) -> String {
 /// Build the user prompt for generating an event announcement.
 pub fn announcement_user_prompt(event: &Event) -> String {
     let time_str = format_event_time(event.event_time);
-    let raid = event.raid_type.as_deref().unwrap_or(&event.name);
+    let raid_type = event.raid_type.as_deref().unwrap_or("raid");
     let notes = event.notes.as_deref().unwrap_or("");
     format!(
         "Write a short, exciting raid announcement for a World of Warcraft: Burning Crusade raid. \
-         Raid: {}. Scheduled: {}. {}. \
+         Event name: {}. Raid type: {}. Scheduled: {}. Notes: {}. \
          Keep it under 3 sentences. Be dramatic and in-character.",
-        raid, time_str, notes
+        event.name, raid_type, time_str, notes
     )
 }
 
 /// Build the user prompt for a reminder message.
 pub fn reminder_user_prompt(event: &Event, signup_count: usize) -> String {
     let time_str = format_event_time(event.event_time);
-    let raid = event.raid_type.as_deref().unwrap_or(&event.name);
+    let raid_type = event.raid_type.as_deref().unwrap_or("raid");
     format!(
-        "Write a short raid reminder for {}. It starts {}. {} players have signed up. \
+        "Write a short raid reminder for {} ({}). It starts {}. {} players have signed up. \
          Be urgent and in-character. Under 2 sentences.",
-        raid, time_str, signup_count
+        event.name, raid_type, time_str, signup_count
     )
 }
 
