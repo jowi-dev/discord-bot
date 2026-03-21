@@ -1,7 +1,7 @@
 use chrono::{TimeZone, Utc};
 use chrono_tz::US::Eastern;
 
-use crate::db::{Event, Signup};
+use crate::db::{CharacterInfo, Event, Signup};
 
 /// Role shorthand normalization
 pub fn normalize_role(s: &str) -> &'static str {
@@ -32,14 +32,17 @@ pub fn format_event_summary(event: &Event) -> String {
 }
 
 /// Format signup names with Discord @mentions where possible.
-/// `resolve_mention` is a closure mapping discord_user_id -> mention string.
-pub fn format_event_detail_with_mentions<F>(
+/// `resolve_mention` maps discord_user_id -> Discord mention string.
+/// `resolve_char_info` maps character_name -> optional CharacterInfo for class display.
+pub fn format_event_detail_with_mentions<F, G>(
     event: &Event,
     signups: &[Signup],
     resolve_mention: F,
+    resolve_char_info: G,
 ) -> String
 where
     F: Fn(&str) -> String,
+    G: Fn(&str) -> Option<CharacterInfo>,
 {
     let mut out = String::new();
 
@@ -73,7 +76,11 @@ where
                 .iter()
                 .map(|s| {
                     let mention = resolve_mention(&s.discord_user_id);
-                    format!("{} ({})", s.character_name, mention)
+                    let class_tag = resolve_char_info(&s.character_name)
+                        .and_then(|c| c.class)
+                        .map(|c| format!(" {}", c))
+                        .unwrap_or_default();
+                    format!("{}{} ({})", s.character_name, class_tag, mention)
                 })
                 .collect::<Vec<_>>()
                 .join(", ")

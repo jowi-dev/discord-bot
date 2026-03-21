@@ -26,7 +26,10 @@ pub fn init(conn: &Connection) -> Result<()> {
             name TEXT PRIMARY KEY COLLATE NOCASE,
             discord_user_id TEXT,
             added_by TEXT NOT NULL,
-            added_at INTEGER NOT NULL DEFAULT (unixepoch())
+            added_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            class TEXT,
+            race TEXT,
+            level INTEGER
         );
 
 
@@ -67,6 +70,11 @@ pub fn init(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO characters (name, added_by, added_at)
          SELECT name, added_by, added_at FROM tracked_characters;"
     );
+
+    // Add class/race/level columns to existing databases (best-effort, fails silently if already present)
+    let _ = conn.execute_batch("ALTER TABLE characters ADD COLUMN class TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE characters ADD COLUMN race TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE characters ADD COLUMN level INTEGER;");
 
     Ok(())
 }
@@ -166,13 +174,23 @@ pub fn remove_character(conn: &Connection, name: &str) -> Result<bool> {
     Ok(rows > 0)
 }
 
-/// Claim a character: associate it with a Discord user.
+#[derive(Debug)]
+pub struct CharacterInfo {
+    pub name: String,
+    pub class: Option<String>,
+    pub race: Option<String>,
+    pub level: Option<i64>,
+}
+
+/// Claim a character: associate it with a Discord user and store WoW data.
 /// Inserts the character if it doesn't exist yet, then sets discord_user_id.
-/// Returns Err if the character is already claimed by a different user.
 pub fn claim_character(
     conn: &Connection,
     name: &str,
     discord_user_id: &str,
+    class: Option<&str>,
+    race: Option<&str>,
+    level: Option<i64>,
 ) -> Result<ClaimResult> {
     // Upsert the character row
     conn.execute(
@@ -191,16 +209,40 @@ pub fn claim_character(
         .flatten();
 
     match existing {
-        Some(ref uid) if uid == discord_user_id => return Ok(ClaimResult::AlreadyYours),
+        Some(ref uid) if uid == discord_user_id => {
+            // Already theirs — still update WoW data in case it changed
+            conn.execute(
+                "UPDATE characters SET class = ?1, race = ?2, level = ?3 WHERE name = ?4",
+                params![class, race, level, name],
+            )?;
+            return Ok(ClaimResult::AlreadyYours);
+        }
         Some(_) => return Ok(ClaimResult::TakenByOther),
         None => {}
     }
 
     conn.execute(
-        "UPDATE characters SET discord_user_id = ?1 WHERE name = ?2",
-        params![discord_user_id, name],
+        "UPDATE characters SET discord_user_id = ?1, class = ?2, race = ?3, level = ?4 WHERE name = ?5",
+        params![discord_user_id, class, race, level, name],
     )?;
     Ok(ClaimResult::Claimed)
+}
+
+pub fn get_character_info(conn: &Connection, name: &str) -> Result<Option<CharacterInfo>> {
+    match conn.query_row(
+        "SELECT name, class, race, level FROM characters WHERE name = ?1",
+        params![name],
+        |row| Ok(CharacterInfo {
+            name: row.get(0)?,
+            class: row.get(1)?,
+            race: row.get(2)?,
+            level: row.get(3)?,
+        }),
+    ) {
+        Ok(info) => Ok(Some(info)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 pub enum ClaimResult {
@@ -218,14 +260,19 @@ pub fn unclaim_character(conn: &Connection, name: &str, discord_user_id: &str) -
     Ok(rows > 0)
 }
 
-pub fn get_user_characters(conn: &Connection, discord_user_id: &str) -> Result<Vec<String>> {
+pub fn get_user_characters(conn: &Connection, discord_user_id: &str) -> Result<Vec<CharacterInfo>> {
     let mut stmt = conn.prepare(
-        "SELECT name FROM characters WHERE discord_user_id = ?1 ORDER BY name",
+        "SELECT name, class, race, level FROM characters WHERE discord_user_id = ?1 ORDER BY name",
     )?;
-    let names = stmt
-        .query_map(params![discord_user_id], |row| row.get(0))?
-        .collect::<Result<Vec<String>>>()?;
-    Ok(names)
+    let chars = stmt
+        .query_map(params![discord_user_id], |row| Ok(CharacterInfo {
+            name: row.get(0)?,
+            class: row.get(1)?,
+            race: row.get(2)?,
+            level: row.get(3)?,
+        }))?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(chars)
 }
 
 /// Look up the Discord user ID for a character name (case-insensitive).
@@ -557,7 +604,8 @@ mod tests {
         add_character(&conn, "Zara", "user123").unwrap();
         conn.execute("UPDATE characters SET discord_user_id = 'user123' WHERE name IN ('Pyuul', 'Zara')", []).unwrap();
         let chars = get_user_characters(&conn, "user123").unwrap();
-        assert_eq!(chars, vec!["Pyuul", "Zara"]);
+        let names: Vec<&str> = chars.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Pyuul", "Zara"]);
     }
 
     #[test]

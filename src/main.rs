@@ -534,9 +534,16 @@ impl Handler {
                 match event_opt {
                     None => { let _ = msg.channel_id.say(&ctx.http, "Raid not found.").await; }
                     Some(event) => {
-                        let text = events::format_event_detail_with_mentions(&event, &signups, |uid| {
-                            format!("<@{}>", uid)
-                        });
+                        let db_ref = Arc::clone(&self.db);
+                        let text = events::format_event_detail_with_mentions(
+                            &event,
+                            &signups,
+                            |uid| format!("<@{}>", uid),
+                            |char_name| {
+                                let conn = db_ref.try_lock().ok()?;
+                                db::get_character_info(&conn, char_name).ok().flatten()
+                            },
+                        );
                         if let Err(why) = msg.channel_id.say(&ctx.http, &text).await {
                             error!("{:?}", why);
                         }
@@ -1321,7 +1328,14 @@ impl EventHandler for Handler {
             let response = if chars.is_empty() {
                 "You have no claimed characters. Use `!claim <name>` to link one.".to_string()
             } else {
-                format!("**Your characters:** {}", chars.join(", "))
+                let lines: Vec<String> = chars.iter().map(|c| {
+                    match (&c.class, &c.race, &c.level) {
+                        (Some(cls), Some(race), Some(lvl)) => format!("**{}** — Level {} {} {}", c.name, lvl, race, cls),
+                        (Some(cls), _, _) => format!("**{}** — {}", c.name, cls),
+                        _ => format!("**{}**", c.name),
+                    }
+                }).collect();
+                lines.join("\n")
             };
             if let Err(why) = msg.channel_id.say(&ctx.http, &response).await {
                 error!("Error sending message: {:?}", why);
@@ -1362,11 +1376,29 @@ impl EventHandler for Handler {
                 }
                 return;
             }
+
+            // Optionally fetch WoW data to store class/race/level
+            let (class, race, level) = if self.battlenet_auth.is_some() {
+                let typing = msg.channel_id.start_typing(&ctx.http);
+                let result = match self.fetch_wow_character(name).await {
+                    Ok(c) => (Some(c.character_class.name), Some(c.race.name), Some(c.level as i64)),
+                    Err(_) => (None, None, None),
+                };
+                drop(typing);
+                result
+            } else {
+                (None, None, None)
+            };
+
             let user_id = msg.author.id.to_string();
             let conn = self.db.lock().await;
-            match db::claim_character(&conn, name, &user_id) {
+            match db::claim_character(&conn, name, &user_id, class.as_deref(), race.as_deref(), level) {
                 Ok(db::ClaimResult::Claimed) => {
-                    if let Err(why) = msg.channel_id.say(&ctx.http, &format!("**{}** is now linked to your account.", name)).await {
+                    let detail = match (&class, &race, &level) {
+                        (Some(c), Some(r), Some(l)) => format!(" — Level {} {} {}", l, r, c),
+                        _ => String::new(),
+                    };
+                    if let Err(why) = msg.channel_id.say(&ctx.http, &format!("**{}** is now linked to your account{}.", name, detail)).await {
                         error!("Error sending message: {:?}", why);
                     }
                 }
