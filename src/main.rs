@@ -1723,8 +1723,8 @@ impl BackgroundHandler {
         let now = Utc::now().timestamp();
         // Window: events starting within the next hour
         let one_hour = now + 3600;
-        // Window: events starting within the next 25 hours (daily digest covers next day)
-        let one_day = now + 90000;
+        // Window: events starting within the next 7 days (daily digest)
+        let seven_days = now + (7 * 24 * 3600);
 
         let reminder_channels: Vec<ChannelId> = {
             let conn = self.db.lock().await;
@@ -1791,32 +1791,44 @@ impl BackgroundHandler {
             }
         }
 
-        // Daily digest: events in the next 24h (but not within the next hour, already handled above)
-        let daily_events = {
+        // Daily digest: fire once per calendar day (UTC), not every hour
+        let today_utc = Utc::now().format("%Y-%m-%d").to_string();
+        let last_digest = {
             let conn = self.db.lock().await;
-            db::get_events_in_window(&conn, one_hour, one_day).unwrap_or_default()
+            db::get_config(&conn, "last_digest_date").ok().flatten().unwrap_or_default()
         };
 
-        if !daily_events.is_empty() {
-            let mut digest = "📅 **Upcoming Raids (next 24h):**\n".to_string();
-            for event in &daily_events {
-                let signup_count = {
-                    let conn = self.db.lock().await;
-                    db::get_signups(&conn, event.id).map(|s| s.len()).unwrap_or(0)
-                };
-                digest.push_str(&format!(
-                    "  {} — {} signed up\n",
-                    events::format_event_summary(event),
-                    signup_count
-                ));
-            }
-            digest.push_str("\nSign up with `!raid signup <id> <character>`");
+        if last_digest != today_utc {
+            let daily_events = {
+                let conn = self.db.lock().await;
+                db::get_events_in_window(&conn, now, seven_days).unwrap_or_default()
+            };
 
-            for channel in &reminder_channels {
-                if let Err(e) = channel.say(&ctx.http, &digest).await {
-                    error!("Failed to send daily digest to {}: {:?}", channel, e);
+            if !daily_events.is_empty() {
+                let mut digest = "📅 **Upcoming Raids (next 7 days):**\n".to_string();
+                for event in &daily_events {
+                    let signup_count = {
+                        let conn = self.db.lock().await;
+                        db::get_signups(&conn, event.id).map(|s| s.len()).unwrap_or(0)
+                    };
+                    digest.push_str(&format!(
+                        "  {} — {} signed up\n",
+                        events::format_event_summary(event),
+                        signup_count
+                    ));
+                }
+                digest.push_str("\nSign up with `!raid signup <id> <character>`");
+
+                for channel in &reminder_channels {
+                    if let Err(e) = channel.say(&ctx.http, &digest).await {
+                        error!("Failed to send daily digest to {}: {:?}", channel, e);
+                    }
                 }
             }
+
+            // Mark digest as sent for today even if no events (avoids re-checking every hour)
+            let conn = self.db.lock().await;
+            let _ = db::set_config(&conn, "last_digest_date", &today_utc);
         }
     }
 }
